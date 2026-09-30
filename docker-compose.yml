@@ -1,0 +1,28 @@
+name: citizen_id_secure
+
+services:
+  db:
+    build: .
+    image: citizen_id_secure:16-pgaudit
+    container_name: citizen_id_secure
+    restart: always
+    environment:
+      POSTGRES_USER: digital_citizen_admin
+      POSTGRES_PASSWORD: digital_citizen_password
+      POSTGRES_DB: citizen_id_secure
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    command: >
+      postgres
+      -c password_encryption='scram-sha-256'
+      -c log_connections=on
+      -c shared_preload_libraries='pgaudit'
+      -c pgaudit.log='ddl, write, role'
+      -c pgaudit.log_parameter=on
+
+volumes:
+  pgdata:
