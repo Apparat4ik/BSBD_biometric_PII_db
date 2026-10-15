@@ -95,7 +95,10 @@ CREATE TABLE app.identity_documents (
     issue_date DATE NOT NULL,
     expiry_date DATE,
     is_verified BOOLEAN DEFAULT false,
-    CHECK (expiry_date > issue_date OR expiry_date IS NULL) 
+    CONSTRAINT chk_document_dates_and_status CHECK (
+    (expiry_date > issue_date OR expiry_date IS NULL)
+    AND (NOT is_verified OR expiry_date IS NOT NULL)
+    AND (expiry_date IS NULL OR (expiry_date - issue_date) <= 7305))
 );
 
 CREATE TABLE app.biometrics (
@@ -123,6 +126,17 @@ CREATE TABLE audit.login_log (
     login_time TIMESTAMP WITH TIME ZONE DEFAULT now(),
     db_username VARCHAR(100) NOT NULL,
     client_ip INET
+);
+
+
+CREATE TABLE audit.function_calls (
+    id SERIAL PRIMARY KEY,
+    call_time TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    function_name VARCHAR(150) NOT NULL,
+    caller_role VARCHAR(100) NOT NULL,
+    input_params JSONB,
+    success BOOLEAN NOT NULL,
+    error_message TEXT
 );
 
 
@@ -348,3 +362,237 @@ CREATE EVENT TRIGGER login_trigger ON login
 
 -- Выдаем право security_admin на администрирование этой функции
 GRANT EXECUTE ON FUNCTION audit.log_connection() TO security_admin;
+
+
+
+
+
+-- Создание функций
+
+-- Функция предоставления доступа к серису
+CREATE OR REPLACE FUNCTION app.grant_service_access(p_profile_id UUID, p_service_id INT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = app, ref, audit, public
+AS $$
+DECLARE
+    v_caller VARCHAR := session_user;
+    v_profile_trust INT;
+    v_service_trust INT;
+    v_is_active BOOLEAN;
+BEGIN
+    -- Валидация входных данных
+    IF p_profile_id IS NULL OR p_service_id IS NULL THEN
+        RAISE EXCEPTION 'Параметры p_profile_id и p_service_id не могут быть NULL';
+    END IF;
+
+    -- Проверка существования и статуса профиля
+    SELECT trust_level_id, is_active INTO v_profile_trust, v_is_active 
+    FROM app.digital_profiles WHERE id = p_profile_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Цифровой профиль не найден';
+    END IF;
+    IF NOT v_is_active THEN
+        RAISE EXCEPTION 'Цифровой профиль деактивирован';
+    END IF;
+
+    -- Проверка существования сервиса
+    SELECT required_trust_level INTO v_service_trust 
+    FROM ref.digital_services WHERE id = p_service_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Сервис не найден';
+    END IF;
+
+    -- проверка уровня доверия
+    IF v_profile_trust < v_service_trust THEN
+        RAISE EXCEPTION 'Недостаточный уровень доверия для доступа к сервису';
+    END IF;
+
+    -- Выполнение операции
+    INSERT INTO app.service_access_grants (profile_id, service_id, expires_at)
+    VALUES (p_profile_id, p_service_id, now() + interval '1 year')
+    ON CONFLICT (profile_id, service_id) 
+    DO UPDATE SET expires_at = EXCLUDED.expires_at, granted_at = now();
+
+    -- Логирование успешного выполнения
+    INSERT INTO audit.function_calls(function_name, caller_role, input_params, success)
+    VALUES ('app.grant_service_access', v_caller, jsonb_build_object('profile_id', p_profile_id, 'service_id', p_service_id), TRUE);
+
+    RETURN TRUE;
+
+EXCEPTION WHEN OTHERS THEN
+    -- Перехват ошибки
+    INSERT INTO audit.function_calls(function_name, caller_role, input_params, success, error_message)
+    VALUES ('app.grant_service_access', v_caller, jsonb_build_object('profile_id', p_profile_id, 'service_id', p_service_id), FALSE, SQLERRM);
+    RETURN FALSE;
+END;
+$$;
+
+
+
+-- Функция регистрации биометрических данных
+CREATE OR REPLACE FUNCTION app.register_biometrics(
+    p_profile_id UUID, 
+    p_bio_type_id INT, 
+    p_template_hash TEXT, 
+    p_raw_data_enc BYTEA
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = app, ref, audit, public
+AS $$
+DECLARE
+    v_caller VARCHAR := session_user; 
+    v_is_active BOOLEAN;
+    v_retention_days INT;
+BEGIN
+    -- Валидация входных параметров
+    IF p_profile_id IS NULL OR p_bio_type_id IS NULL THEN
+        RAISE EXCEPTION 'ID профиля и типа биометрии не могут быть NULL';
+    END IF;
+    
+    IF p_template_hash IS NULL OR length(trim(p_template_hash)) = 0 THEN
+        RAISE EXCEPTION 'Хэш шаблона биометрии не может быть пустым';
+    END IF;
+
+    -- Проверка статуса профиля
+    SELECT is_active INTO v_is_active 
+    FROM app.digital_profiles WHERE id = p_profile_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Цифровой профиль не найден';
+    END IF;
+    IF NOT v_is_active THEN
+        RAISE EXCEPTION 'Цифровой профиль деактивирован. Регистрация биометрии запрещена.';
+    END IF;
+
+    -- Проверка типа биометрии
+    SELECT retention_period_days INTO v_retention_days
+    FROM ref.biometric_types WHERE id = p_bio_type_id;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Недопустимый тип биометрии';
+    END IF;
+
+    -- Вставка или обновление данных
+    INSERT INTO app.biometrics (profile_id, bio_type_id, template_hash, raw_data_enc, registrated_at)
+    VALUES (p_profile_id, p_bio_type_id, p_template_hash, p_raw_data_enc, now())
+    ON CONFLICT (id) DO UPDATE 
+    SET template_hash = EXCLUDED.template_hash,
+        raw_data_enc = EXCLUDED.raw_data_enc,
+        registrated_at = EXCLUDED.registrated_at;
+
+    -- Логирование успешного выполнения
+    INSERT INTO audit.function_calls(function_name, caller_role, input_params, success)
+    VALUES (
+        'app.register_biometrics', 
+        v_caller, 
+        jsonb_build_object('profile_id', p_profile_id, 'bio_type_id', p_bio_type_id), 
+        TRUE
+    );
+
+    RETURN TRUE;
+
+EXCEPTION WHEN OTHERS THEN
+    -- Перехват ошибки и логирование
+    INSERT INTO audit.function_calls(function_name, caller_role, input_params, success, error_message)
+    VALUES (
+        'app.register_biometrics', 
+        v_caller, 
+        jsonb_build_object('profile_id', p_profile_id, 'bio_type_id', p_bio_type_id), 
+        FALSE, 
+        SQLERRM
+    );
+    RETURN FALSE;
+END;
+$$;
+
+
+
+-- Функция верификация документа удостоверяющего личность
+CREATE OR REPLACE FUNCTION app.verify_identity_document(
+    p_document_number VARCHAR(50)
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = app, ref, audit, public
+AS $$
+DECLARE
+    v_caller VARCHAR := session_user;
+    v_doc_id UUID;
+    v_is_verified BOOLEAN;
+    v_expiry_date DATE;
+    v_requires_verification BOOLEAN;
+BEGIN
+    -- Валидация входа
+    IF p_document_number IS NULL OR length(trim(p_document_number)) = 0 THEN
+        RAISE EXCEPTION 'Номер документа не может быть пустым';
+    END IF;
+
+    -- Получение данных документа и его типа
+    SELECT d.id, d.is_verified, d.expiry_date, dt.requires_verification 
+    INTO v_doc_id, v_is_verified, v_expiry_date, v_requires_verification
+    FROM app.identity_documents d
+    JOIN ref.documents_types dt ON d.document_type_id = dt.id
+    WHERE d.document_number = p_document_number;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Документ с номером % не найден', p_document_number;
+    END IF;
+
+    -- Проверка документов
+    IF NOT v_requires_verification THEN
+        RAISE EXCEPTION 'Этот тип документа не требует верификации';
+    END IF;
+
+    IF v_is_verified THEN
+        RAISE EXCEPTION 'Документ уже верифицирован';
+    END IF;
+
+    IF v_expiry_date IS NOT NULL AND v_expiry_date < current_date THEN
+        RAISE EXCEPTION 'Срок действия документа истек. Верификация невозможна.';
+    END IF;
+
+    -- Выполнение обновления
+    UPDATE app.identity_documents 
+    SET is_verified = true 
+    WHERE id = v_doc_id;
+
+    -- Логирование успеха
+    INSERT INTO audit.function_calls(function_name, caller_role, input_params, success)
+    VALUES (
+        'app.verify_identity_document', 
+        v_caller, 
+        jsonb_build_object('document_number', p_document_number), 
+        TRUE
+    );
+
+    RETURN TRUE;
+
+EXCEPTION WHEN OTHERS THEN
+    -- Логирование ошибки
+    INSERT INTO audit.function_calls(function_name, caller_role, input_params, success, error_message)
+    VALUES (
+        'app.verify_identity_document', 
+        v_caller, 
+        jsonb_build_object('document_number', p_document_number), 
+        FALSE, 
+        SQLERRM
+    );
+    RETURN FALSE;
+END;
+$$;
+
+
+REVOKE ALL ON FUNCTION app.grant_service_access(UUID, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION app.verify_identity_document(VARCHAR) FROM PUBLIC;
+REVOKE ALL ON FUNCTION app.register_biometrics(UUID, INT, TEXT, BYTEA) FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION app.grant_service_access(UUID, INT) TO app_writer;
+GRANT EXECUTE ON FUNCTION app.verify_identity_document(VARCHAR) TO app_writer;
+GRANT EXECUTE ON FUNCTION app.register_biometrics(UUID, INT, TEXT, BYTEA) TO app_writer;
