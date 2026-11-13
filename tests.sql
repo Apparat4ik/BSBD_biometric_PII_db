@@ -233,3 +233,106 @@ BEGIN
     RAISE NOTICE 'Время выполнения вставки 10 000 строк (TRIGGER): % мс', round(v_duration, 2);
 END;
 $$;
+
+
+
+
+
+-- ЛР3
+
+
+-- ТЕСТ 1: Резервный путь (fallback) сопоставления роли -> segment_id (без вызова set_session_ctx)
+-- Роль u_reader по умолчанию привязана к сегменту 1 (SEG_PUBLIC)
+RESET ROLE;
+BEGIN;
+SET LOCAL ROLE u_reader;
+SELECT current_user AS active_role, app.get_active_segment_id() AS resolved_segment;
+SELECT id, first_name, last_name, snils, segment_id FROM app.citizens;
+COMMIT;
+
+-- ТЕСТ 2: Попытка чтения «чужих» строк из сегментов 2 и 3 (должно быть пусто — 0 строк)
+BEGIN;
+SET LOCAL ROLE u_reader;
+SELECT id, first_name, last_name, snils, segment_id
+FROM app.citizens
+WHERE segment_id IN (2, 3);
+COMMIT;
+
+-- ТЕСТ 3: Успешная установка контекста через app.set_session_ctx(2, 'operator_gov_01')
+-- Роль u_writer имеет право на сегменты 1 и 2
+BEGIN;
+SET LOCAL ROLE u_writer;
+SELECT app.set_session_ctx(2, 'operator_gov_01') AS ctx_set_result;
+SELECT current_setting('app.segment_id', true) AS guc_segment_id,
+       current_setting('app.actor_id', true) AS guc_actor_id;
+SELECT id, first_name, last_name, snils, segment_id FROM app.citizens;
+COMMIT;
+
+-- ТЕСТ 4: Ошибка вызова app.set_session_ctx() при передаче недоступного роли сегмента (сегмент 3)
+-- Роль u_writer НЕ имеет доступа к сегменту 3 (SEG_SPECIAL) — ожидается ERROR
+BEGIN;
+SET LOCAL ROLE u_writer;
+SELECT app.set_session_ctx(3, 'unauthorized_actor');
+ROLLBACK;
+
+-- ТЕСТ 5: Корректная вставка (INSERT) новой записи в своем сегменте (сегмент 1)
+BEGIN;
+SET LOCAL ROLE u_writer;
+SELECT app.set_session_ctx(1, 'operator_mfc_01');
+INSERT INTO app.citizens (first_name, last_name, birth_date, snils, segment_id)
+VALUES ('Павел', 'Орлов', '1993-06-12', '222-333-444 55', 1)
+RETURNING id, first_name, last_name, snils, segment_id;
+COMMIT;
+
+-- ТЕСТ 6: Ошибка вставки (INSERT) записи с чужим segment_id (попытка вставить segment_id = 2 из сегмента 1)
+-- Ожидается ошибка: new row violates row-level security policy for table "citizens"
+BEGIN;
+SET LOCAL ROLE u_writer;
+SELECT app.set_session_ctx(1, 'operator_mfc_01');
+INSERT INTO app.citizens (first_name, last_name, birth_date, snils, segment_id)
+VALUES ('Нарушитель', 'Тестовый', '1991-01-01', '999-888-777 66', 2);
+ROLLBACK;
+
+-- ТЕСТ 7: Корректное обновление (UPDATE) строки в своем сегменте (сегмент 1)
+BEGIN;
+SET LOCAL ROLE u_writer;
+SELECT app.set_session_ctx(1, 'operator_mfc_01');
+UPDATE app.citizens
+SET last_name = 'Орлов-Соколов'
+WHERE snils = '222-333-444 55'
+RETURNING id, first_name, last_name, snils, segment_id;
+COMMIT;
+
+-- ТЕСТ 8: Запрет кросс-сегментного обновления (UPDATE): попытка перенести строку из сегмента 1 в сегмент 2
+-- Ожидается ошибка WITH CHECK: new row violates row-level security policy for table "citizens"
+BEGIN;
+SET LOCAL ROLE u_writer;
+SELECT app.set_session_ctx(1, 'operator_mfc_01');
+UPDATE app.citizens
+SET segment_id = 2
+WHERE snils = '222-333-444 55';
+ROLLBACK;
+
+-- ТЕСТ 9: Попытка удаления (DELETE) чужих строк (возвращает DELETE 0) и штатное удаление своей строки (DELETE 1)
+BEGIN;
+SET LOCAL ROLE u_writer;
+SELECT app.set_session_ctx(1, 'operator_mfc_01');
+-- Попытка удалить записи сегмента 2 (затронуто 0 строк)
+DELETE FROM app.citizens WHERE segment_id = 2;
+-- Удаление тестовой записи своего сегмента 1 (затронута 1 строка)
+DELETE FROM app.citizens WHERE snils = '222-333-444 55'
+RETURNING id, first_name, last_name, snils, segment_id;
+COMMIT;
+
+-- ТЕСТ 10: Режим суперпользователя (ревизора) для роли auditor — видимость всех сегментов без ограничений RLS
+BEGIN;
+SET LOCAL ROLE auditor;
+SELECT current_user AS active_role;
+SELECT s.id AS segment_id, s.segment_code, s.confidentiality_level, count(c.id) AS citizens_count
+FROM ref.segments s
+LEFT JOIN app.citizens c ON c.segment_id = s.id
+GROUP BY s.id, s.segment_code, s.confidentiality_level
+ORDER BY s.id;
+SELECT id, first_name, last_name, snils, segment_id FROM app.citizens ORDER BY segment_id, snils;
+COMMIT;
+RESET ROLE;

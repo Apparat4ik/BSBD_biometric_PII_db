@@ -214,14 +214,18 @@ SELECT
 FROM app.citizens;
 
 -- 4. Добавляем паспорта (связь с цифровым профилем)
-INSERT INTO app.identity_documents (profile_id, document_type_id, document_number, issue_date, is_verified)
+INSERT INTO app.identity_documents (profile_id, document_type_id, document_number, issue_date, expiry_date, is_verified)
 SELECT 
     dp.id, 
     (SELECT id FROM ref.documents_types WHERE type_name = 'Паспорт гражданина РФ'), 
     '45' || cast(floor(random() * 90 + 10) as int) || ' ' || cast(floor(random() * 900000 + 100000) as int),
-    '2015-01-01'::date + (random() * (interval '5 years')),
+    d.issue_dt,
+    d.issue_dt + interval '10 years',
     true
-FROM app.digital_profiles dp;
+FROM app.digital_profiles dp
+CROSS JOIN LATERAL (
+    SELECT ('2015-01-01'::date + (random() * interval '5 years'))::date AS issue_dt
+) d;
 
 -- 5. Добавляем тестовые биометрические слепки для части профилей (шифрование raw_data_enc)
 INSERT INTO app.biometrics (profile_id, bio_type_id, template_hash, raw_data_enc)
@@ -314,33 +318,6 @@ ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app, ref
 ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app, ref 
     GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO app_writer;
 
-
--- Включаем RLS для таблицы профилей
-ALTER TABLE app.digital_profiles ENABLE ROW LEVEL SECURITY;
-ALTER TABLE app.digital_profiles FORCE ROW LEVEL SECURITY;
-
--- Политика для владельца: видит и может изменять всё
-CREATE POLICY profiles_owner_policy 
-ON app.digital_profiles 
-FOR ALL 
-TO app_owner 
-USING (true) 
-WITH CHECK (true);
-
--- Политика для читателей и писателей: видят только активные профили
-CREATE POLICY profiles_active_only_policy 
-ON app.digital_profiles 
-FOR SELECT 
-TO app_reader, app_writer 
-USING (is_active = true);
-
--- Политика для писателей: могут обновлять только активные профили
-CREATE POLICY profiles_update_active_policy 
-ON app.digital_profiles 
-FOR UPDATE 
-TO app_writer 
-USING (is_active = true)
-WITH CHECK (is_active = true);
 
 
 -- Функция записи лога при подключении
@@ -596,3 +573,461 @@ REVOKE ALL ON FUNCTION app.register_biometrics(UUID, INT, TEXT, BYTEA) FROM PUBL
 GRANT EXECUTE ON FUNCTION app.grant_service_access(UUID, INT) TO app_writer;
 GRANT EXECUTE ON FUNCTION app.verify_identity_document(VARCHAR) TO app_writer;
 GRANT EXECUTE ON FUNCTION app.register_biometrics(UUID, INT, TEXT, BYTEA) TO app_writer;
+
+
+
+
+
+-- Справочник сегментов (контуров критичности и конфиденциальности данных)
+CREATE TABLE IF NOT EXISTS ref.segments (
+    id SERIAL PRIMARY KEY,
+    segment_code VARCHAR(50) UNIQUE NOT NULL,
+    segment_name VARCHAR(150) NOT NULL,
+    confidentiality_level VARCHAR(50) NOT NULL,
+    description TEXT
+);
+
+COMMENT ON TABLE ref.segments IS 'Справочник сегментов (контуров критичности и конфиденциальности данных граждан)';
+
+-- Справочник привязки ролей БД к допустимым сегментам
+CREATE TABLE IF NOT EXISTS ref.role_segments (
+    role_name VARCHAR(100) NOT NULL,
+    segment_id INT NOT NULL REFERENCES ref.segments(id) ON DELETE CASCADE,
+    is_default BOOLEAN NOT NULL DEFAULT false,
+    PRIMARY KEY (role_name, segment_id)
+);
+
+COMMENT ON TABLE ref.role_segments IS 'Сопоставление ролей СУБД и разрешенных сегментов данных';
+
+-- Заполнение справочника сегментов
+INSERT INTO ref.segments (id, segment_code, segment_name, confidentiality_level, description) VALUES
+(1, 'SEG_PUBLIC',  'Общегражданский контур', 'PUBLIC',       'Базовый уровень критичности: стандартные цифровые профили граждан'),
+(2, 'SEG_GOV',     'Ведомственный контур',   'CONFIDENTIAL', 'Повышенный уровень конфиденциальности: профили госслужащих и персонала КИИ'),
+(3, 'SEG_SPECIAL', 'Специальный биометрический контур',    'SECRET',       'Высокий уровень критичности: спецсубъекты и защищенные биометрические шаблоны')
+ON CONFLICT (id) DO NOTHING;
+
+-- Заполнение привязки ролей к сегментам:
+-- u_reader / app_reader: по умолчанию сегмент 1
+-- u_writer / app_writer: по умолчанию сегмент 1, разрешено переключение на сегмент 2 (сегмент 3 запрещен)
+-- u_dml_admin / dml_admin: по умолчанию сегмент 2, разрешено переключение на сегмент 3
+-- u_auditor / auditor и u_owner / app_owner: доступ ко всем сегментам (1, 2, 3)
+INSERT INTO ref.role_segments (role_name, segment_id, is_default) VALUES
+('u_reader',    1, true),
+('app_reader',  1, true),
+('u_writer',    1, true),
+('u_writer',    2, false),
+('app_writer',  1, true),
+('app_writer',  2, false),
+('u_dml_admin', 2, true),
+('u_dml_admin', 3, false),
+('dml_admin',   2, true),
+('dml_admin',   3, false),
+('u_auditor',   1, true),
+('u_auditor',   2, false),
+('u_auditor',   3, false),
+('auditor',     1, true),
+('auditor',     2, false),
+('auditor',     3, false),
+('u_owner',     1, true),
+('u_owner',     2, false),
+('u_owner',     3, false),
+('app_owner',   1, true),
+('app_owner',   2, false),
+('app_owner',   3, false)
+ON CONFLICT (role_name, segment_id) DO NOTHING;
+
+
+-- Предоставление прав на новые справочники и чтение таблиц схемы app для роли auditor
+GRANT SELECT ON ref.segments, ref.role_segments TO app_reader, app_writer, dml_admin, auditor;
+GRANT USAGE ON SCHEMA app, ref TO auditor;
+GRANT SELECT ON ALL TABLES IN SCHEMA app, ref TO auditor;
+
+
+-- ФУНКЦИИ ПЕРЕДАЧИ КОНТЕКСТА И РЕЗЕРВНОГО ОПРЕДЕЛЕНИЯ СЕГМЕНТА
+
+-- Вспомогательная функция резервного сопоставления
+CREATE OR REPLACE FUNCTION app.get_role_default_segment()
+RETURNS INT
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ref, app, public
+AS $$
+    SELECT rs.segment_id
+    FROM ref.role_segments rs
+    WHERE rs.role_name IN (current_user, session_user)
+      AND rs.is_default = true
+    ORDER BY CASE WHEN rs.role_name = current_user THEN 1 ELSE 2 END
+    LIMIT 1;
+$$;
+
+-- Функция вычисления активного сегмента сессии
+CREATE OR REPLACE FUNCTION app.get_active_segment_id()
+RETURNS INT
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ref, app, public
+AS $$
+    SELECT COALESCE(
+        NULLIF(current_setting('app.segment_id', true), '')::INT,
+        app.get_role_default_segment()
+    );
+$$;
+
+-- Функция установки контекста сессии
+CREATE OR REPLACE FUNCTION app.set_session_ctx(p_segment_id INT, p_actor_id TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = app, ref, audit, public
+AS $$
+DECLARE
+    v_caller VARCHAR := current_user;
+    v_session_usr VARCHAR := session_user;
+    v_has_access BOOLEAN := false;
+BEGIN
+    -- Проверка обязательных параметров
+    IF p_segment_id IS NULL OR p_actor_id IS NULL OR length(trim(p_actor_id)) = 0 THEN
+        RAISE EXCEPTION 'Параметры segment_id и actor_id не могут быть пустыми';
+    END IF;
+
+    -- Проверка существования сегмента в справочнике ref.segments
+    IF NOT EXISTS (SELECT 1 FROM ref.segments WHERE id = p_segment_id) THEN
+        RAISE EXCEPTION 'Сегмент с идентификатором % не существует', p_segment_id;
+    END IF;
+
+    -- Проверка права вызывающей роли (current_user или session_user) на запрошенный сегмент
+    SELECT EXISTS (
+        SELECT 1
+        FROM ref.role_segments rs
+        WHERE rs.role_name IN (v_caller, v_session_usr)
+          AND rs.segment_id = p_segment_id
+    ) INTO v_has_access;
+
+    IF NOT v_has_access THEN
+        -- Логирование неуспешной попытки смены контекста
+        INSERT INTO audit.function_calls(function_name, caller_role, input_params, success, error_message)
+        VALUES (
+            'app.set_session_ctx',
+            v_caller,
+            jsonb_build_object('segment_id', p_segment_id, 'actor_id', p_actor_id, 'session_user', v_session_usr),
+            FALSE,
+            format('Доступ запрещен: роль %s (сессия %s) не имеет прав на сегмент %s', v_caller, v_session_usr, p_segment_id)
+        );
+
+        RAISE EXCEPTION 'Доступ запрещен: роль % не имеет прав на сегмент %', v_caller, p_segment_id;
+    END IF;
+
+    -- Установка локальных параметров GUC (SET LOCAL эквивалент через set_config(..., true))
+    PERFORM set_config('app.segment_id', p_segment_id::TEXT, true);
+    PERFORM set_config('app.actor_id', trim(p_actor_id), true);
+    PERFORM set_config('app.user_id', trim(p_actor_id), true);
+
+    -- Логирование успешной установки контекста
+    INSERT INTO audit.function_calls(function_name, caller_role, input_params, success)
+    VALUES (
+        'app.set_session_ctx',
+        v_caller,
+        jsonb_build_object('segment_id', p_segment_id, 'actor_id', p_actor_id, 'session_user', v_session_usr),
+        TRUE
+    );
+
+    RETURN TRUE;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION app.get_role_default_segment() FROM PUBLIC;
+REVOKE ALL ON FUNCTION app.get_active_segment_id() FROM PUBLIC;
+REVOKE ALL ON FUNCTION app.set_session_ctx(INT, TEXT) FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION app.get_role_default_segment() TO app_reader, app_writer, dml_admin, auditor, app_owner;
+GRANT EXECUTE ON FUNCTION app.get_active_segment_id() TO app_reader, app_writer, dml_admin, auditor, app_owner;
+GRANT EXECUTE ON FUNCTION app.set_session_ctx(INT, TEXT) TO app_reader, app_writer, dml_admin, auditor, app_owner;
+
+
+-- Добавление segment_id во все ключевые таблицы
+ALTER TABLE app.citizens
+    ADD COLUMN IF NOT EXISTS segment_id INT REFERENCES ref.segments(id) ON DELETE RESTRICT
+    DEFAULT COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment(), 1);
+
+ALTER TABLE app.digital_profiles
+    ADD COLUMN IF NOT EXISTS segment_id INT REFERENCES ref.segments(id) ON DELETE RESTRICT
+    DEFAULT COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment(), 1);
+
+ALTER TABLE app.identity_documents
+    ADD COLUMN IF NOT EXISTS segment_id INT REFERENCES ref.segments(id) ON DELETE RESTRICT
+    DEFAULT COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment(), 1);
+
+ALTER TABLE app.biometrics
+    ADD COLUMN IF NOT EXISTS segment_id INT REFERENCES ref.segments(id) ON DELETE RESTRICT
+    DEFAULT COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment(), 1);
+
+ALTER TABLE app.service_access_grants
+    ADD COLUMN IF NOT EXISTS segment_id INT REFERENCES ref.segments(id) ON DELETE RESTRICT
+    DEFAULT COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment(), 1);
+
+-- Распределение существующих тестовых записей по 3 сегментам
+WITH numbered_citizens AS (
+    SELECT id, row_number() OVER (ORDER BY snils) AS rn
+    FROM app.citizens
+)
+UPDATE app.citizens c
+SET segment_id = CASE
+    WHEN nc.rn <= 4 THEN 1  -- 4 гражданина в SEG_PUBLIC (сегмент 1)
+    WHEN nc.rn <= 7 THEN 2  -- 3 гражданина в SEG_GOV (сегмент 2)
+    ELSE 3                  -- 3 гражданина в SEG_SPECIAL (сегмент 3)
+END
+FROM numbered_citizens nc
+WHERE c.id = nc.id;
+
+-- Синхронизация segment_id в дочерних таблицах по профилю гражданина
+UPDATE app.digital_profiles dp
+SET segment_id = c.segment_id
+FROM app.citizens c
+WHERE dp.citizen_id = c.id;
+
+-- Гарантированное заполнение документов с соблюдением CHECK-ограничения expiry_date, если таблица пуста
+INSERT INTO app.identity_documents (profile_id, document_type_id, document_number, issue_date, expiry_date, is_verified, segment_id)
+SELECT
+    dp.id,
+    (SELECT id FROM ref.documents_types WHERE type_name = 'Паспорт гражданина РФ'),
+    '45' || lpad((row_number() OVER (ORDER BY dp.id))::text, 2, '0') || ' ' || (100000 + row_number() OVER (ORDER BY dp.id))::text,
+    '2018-05-10'::date,
+    '2028-05-10'::date,
+    true,
+    dp.segment_id
+FROM app.digital_profiles dp
+WHERE NOT EXISTS (SELECT 1 FROM app.identity_documents d WHERE d.profile_id = dp.id);
+
+UPDATE app.identity_documents d
+SET segment_id = dp.segment_id
+FROM app.digital_profiles dp
+WHERE d.profile_id = dp.id;
+
+UPDATE app.biometrics b
+SET segment_id = dp.segment_id
+FROM app.digital_profiles dp
+WHERE b.profile_id = dp.id;
+
+UPDATE app.service_access_grants sag
+SET segment_id = dp.segment_id
+FROM app.digital_profiles dp
+WHERE sag.profile_id = dp.id;
+
+-- Установка ограничения NOT NULL после заполнения данных
+ALTER TABLE app.citizens ALTER COLUMN segment_id SET NOT NULL;
+ALTER TABLE app.digital_profiles ALTER COLUMN segment_id SET NOT NULL;
+ALTER TABLE app.identity_documents ALTER COLUMN segment_id SET NOT NULL;
+ALTER TABLE app.biometrics ALTER COLUMN segment_id SET NOT NULL;
+ALTER TABLE app.service_access_grants ALTER COLUMN segment_id SET NOT NULL;
+
+-- Создание покрывающих индексов
+CREATE INDEX IF NOT EXISTS idx_citizens_segment_snils
+    ON app.citizens (segment_id, snils);
+
+CREATE INDEX IF NOT EXISTS idx_profiles_segment_active_citizen
+    ON app.digital_profiles (segment_id, is_active, citizen_id);
+
+CREATE INDEX IF NOT EXISTS idx_documents_segment_profile_num
+    ON app.identity_documents (segment_id, profile_id, document_number);
+
+CREATE INDEX IF NOT EXISTS idx_biometrics_segment_profile_type
+    ON app.biometrics (segment_id, profile_id, bio_type_id);
+
+CREATE INDEX IF NOT EXISTS idx_grants_segment_profile_service
+    ON app.service_access_grants (segment_id, profile_id, service_id);
+
+CREATE INDEX IF NOT EXISTS idx_role_segments_lookup
+    ON ref.role_segments (role_name, is_default, segment_id);
+
+
+-- Включение RLS и FORCE RLS на всех ключевых таблицах
+ALTER TABLE app.citizens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.citizens FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE app.digital_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.digital_profiles FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE app.identity_documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.identity_documents FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE app.biometrics ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.biometrics FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE app.service_access_grants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app.service_access_grants FORCE ROW LEVEL SECURITY;
+
+
+-- Создание политик RLS (SELECT / INSERT / UPDATE / DELETE + РЕЖИМ AUDITOR)
+
+
+-- Таблица app.citizens
+CREATE POLICY citizens_owner_all_policy ON app.citizens
+    FOR ALL TO app_owner
+    USING (true) WITH CHECK (true);
+
+CREATE POLICY citizens_select_rls_policy ON app.citizens
+    FOR SELECT TO app_reader, app_writer, dml_admin, auditor
+    USING (
+        current_user = 'auditor'
+        OR pg_has_role(current_user, 'auditor', 'MEMBER')
+        OR segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY citizens_insert_rls_policy ON app.citizens
+    FOR INSERT TO app_writer, dml_admin
+    WITH CHECK (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY citizens_update_rls_policy ON app.citizens
+    FOR UPDATE TO app_writer, dml_admin
+    USING (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    )
+    WITH CHECK (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY citizens_delete_rls_policy ON app.citizens
+    FOR DELETE TO app_writer, dml_admin
+    USING (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+
+-- Таблица app.digital_profiles
+CREATE POLICY profiles_select_rls_policy ON app.digital_profiles
+    FOR SELECT TO app_reader, app_writer, dml_admin, auditor
+    USING (
+        current_user = 'auditor'
+        OR pg_has_role(current_user, 'auditor', 'MEMBER')
+        OR (
+            is_active = true
+            AND segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+        )
+    );
+
+CREATE POLICY profiles_insert_rls_policy ON app.digital_profiles
+    FOR INSERT TO app_writer, dml_admin
+    WITH CHECK (
+        is_active = true
+        AND segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY profiles_update_rls_policy ON app.digital_profiles
+    FOR UPDATE TO app_writer, dml_admin
+    USING (
+        is_active = true
+        AND segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    )
+    WITH CHECK (
+        is_active = true
+        AND segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY profiles_delete_rls_policy ON app.digital_profiles
+    FOR DELETE TO app_writer, dml_admin
+    USING (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+
+-- Таблица app.identity_documents
+CREATE POLICY documents_owner_all_policy ON app.identity_documents
+    FOR ALL TO app_owner
+    USING (true) WITH CHECK (true);
+
+CREATE POLICY documents_select_rls_policy ON app.identity_documents
+    FOR SELECT TO app_reader, app_writer, dml_admin, auditor
+    USING (
+        current_user = 'auditor'
+        OR pg_has_role(current_user, 'auditor', 'MEMBER')
+        OR segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY documents_insert_rls_policy ON app.identity_documents
+    FOR INSERT TO app_writer, dml_admin
+    WITH CHECK (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY documents_update_rls_policy ON app.identity_documents
+    FOR UPDATE TO app_writer, dml_admin
+    USING (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    )
+    WITH CHECK (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY documents_delete_rls_policy ON app.identity_documents
+    FOR DELETE TO app_writer, dml_admin
+    USING (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+
+-- Таблица app.biometrics
+CREATE POLICY biometrics_owner_all_policy ON app.biometrics
+    FOR ALL TO app_owner
+    USING (true) WITH CHECK (true);
+
+CREATE POLICY biometrics_select_rls_policy ON app.biometrics
+    FOR SELECT TO app_reader, app_writer, dml_admin, auditor
+    USING (
+        current_user = 'auditor'
+        OR pg_has_role(current_user, 'auditor', 'MEMBER')
+        OR segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY biometrics_insert_rls_policy ON app.biometrics
+    FOR INSERT TO app_writer, dml_admin
+    WITH CHECK (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY biometrics_update_rls_policy ON app.biometrics
+    FOR UPDATE TO app_writer, dml_admin
+    USING (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    )
+    WITH CHECK (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY biometrics_delete_rls_policy ON app.biometrics
+    FOR DELETE TO app_writer, dml_admin
+    USING (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+
+-- Таблица app.service_access_grants
+CREATE POLICY grants_owner_all_policy ON app.service_access_grants
+    FOR ALL TO app_owner
+    USING (true) WITH CHECK (true);
+
+CREATE POLICY grants_select_rls_policy ON app.service_access_grants
+    FOR SELECT TO app_reader, app_writer, dml_admin, auditor
+    USING (
+        current_user = 'auditor'
+        OR pg_has_role(current_user, 'auditor', 'MEMBER')
+        OR segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY grants_insert_rls_policy ON app.service_access_grants
+    FOR INSERT TO app_writer, dml_admin
+    WITH CHECK (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
+
+CREATE POLICY grants_update_rls_policy ON app.service_access_grants
+    FOR UPDATE TO app_writer, dml_admin
+    USING (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    )
+    WITH CHECK (
+        segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+    );
