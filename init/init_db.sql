@@ -1031,3 +1031,328 @@ CREATE POLICY grants_update_rls_policy ON app.service_access_grants
     WITH CHECK (
         segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
     );
+
+
+
+
+
+-- Дополнение недостающих политик владельца и удаления на существующих таблицах
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies 
+        WHERE schemaname = 'app' AND tablename = 'digital_profiles' AND policyname = 'profiles_owner_all_policy'
+    ) THEN
+        CREATE POLICY profiles_owner_all_policy ON app.digital_profiles
+            FOR ALL TO app_owner USING (true) WITH CHECK (true);
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies 
+        WHERE schemaname = 'app' AND tablename = 'service_access_grants' AND policyname = 'grants_delete_rls_policy'
+    ) THEN
+        CREATE POLICY grants_delete_rls_policy ON app.service_access_grants
+            FOR DELETE TO app_writer, dml_admin
+            USING (
+                segment_id = COALESCE(NULLIF(current_setting('app.segment_id', true), '')::INT, app.get_role_default_segment())
+            );
+    END IF;
+END $$;
+
+
+
+-- Updatable VIEW с WITH CHECK OPTION для рабочего подмножества полей
+CREATE OR REPLACE VIEW app.v_working_digital_profiles
+WITH (security_invoker = true)
+AS
+SELECT
+    id,
+    citizen_id,
+    login,
+    trust_level_id,
+    created_at,
+    is_active,
+    segment_id
+FROM app.digital_profiles
+WHERE is_active = true
+  AND trust_level_id <= 3
+  AND segment_id = COALESCE(
+      NULLIF(current_setting('app.segment_id', true), '')::INT,
+      app.get_role_default_segment()
+  )
+WITH LOCAL CHECK OPTION;
+
+COMMENT ON VIEW app.v_working_digital_profiles IS
+    'Безопасное обновляемое представление цифровых профилей без поля password_hash с контролем модификации (WITH CHECK OPTION)';
+
+GRANT SELECT, INSERT, UPDATE ON app.v_working_digital_profiles TO app_reader, app_writer, dml_admin;
+
+
+-- SECURITY BARRIER VIEW для защищенных агрегированных отчетов
+CREATE OR REPLACE VIEW app.v_segment_security_stats
+WITH (security_barrier = true)
+AS
+SELECT
+    s.id AS segment_id,
+    s.segment_code,
+    s.confidentiality_level,
+    tl.level_code AS trust_level,
+    COUNT(dp.id) AS total_profiles,
+    COUNT(dp.id) FILTER (WHERE dp.is_active = true) AS active_profiles,
+    COUNT(d.id) FILTER (WHERE d.is_verified = true) AS verified_docs_count
+FROM ref.segments s
+LEFT JOIN app.digital_profiles dp
+    ON dp.segment_id = s.id
+   AND (
+       current_user = 'auditor'
+       OR pg_has_role(current_user, 'auditor', 'MEMBER')
+       OR dp.segment_id = COALESCE(
+           NULLIF(current_setting('app.segment_id', true), '')::INT,
+           app.get_role_default_segment()
+       )
+   )
+LEFT JOIN ref.trust_levels tl ON dp.trust_level_id = tl.id
+LEFT JOIN app.identity_documents d ON d.profile_id = dp.id
+GROUP BY s.id, s.segment_code, s.confidentiality_level, tl.level_code;
+
+COMMENT ON VIEW app.v_segment_security_stats IS
+    'Защищенное аналитическое представление с барьером безопасности (SECURITY BARRIER) для получения агрегированной статистики';
+
+GRANT SELECT ON app.v_segment_security_stats TO app_reader, app_writer, dml_admin, auditor;
+
+
+-- Таблица регистрации dml операций в критичных таблицах
+CREATE TABLE IF NOT EXISTS audit.row_change_log (
+    id BIGSERIAL PRIMARY KEY,
+    changed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    db_user VARCHAR(100) NOT NULL,
+    session_user_name VARCHAR(100) NOT NULL,
+    actor_id TEXT,
+    segment_id INT,
+    schema_name VARCHAR(50) NOT NULL,
+    table_name VARCHAR(100) NOT NULL,
+    operation VARCHAR(10) NOT NULL CHECK (operation IN ('UPDATE', 'DELETE')),
+    record_id UUID,
+    old_data JSONB,
+    new_data JSONB
+);
+
+COMMENT ON TABLE audit.row_change_log IS
+    'Журнал истории изменений (UPDATE/DELETE) критичных таблиц с маскированием чувствительных полей';
+
+-- Вспомогательная функция маскирования и хэширования чувствительных атрибутов строки
+CREATE OR REPLACE FUNCTION audit.fn_mask_sensitive_jsonb(p_table_name TEXT, p_row JSONB)
+RETURNS JSONB
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_result JSONB := p_row;
+BEGIN
+    IF p_row IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    -- Таблица граждан: маскирование СНИЛС и добавление SHA-256 хэша
+    IF p_table_name = 'citizens' THEN
+        IF v_result ? 'snils' AND v_result->>'snils' IS NOT NULL THEN
+            v_result := jsonb_set(
+                v_result,
+                '{snils_sha256}',
+                to_jsonb(encode(digest(v_result->>'snils', 'sha256'), 'hex')),
+                true
+            );
+            v_result := jsonb_set(
+                v_result,
+                '{snils}',
+                to_jsonb('***-***-' || right(v_result->>'snils', 6)),
+                false
+            );
+        END IF;
+
+    -- Таблица цифровых профилей: замена bcrypt-хэша пароля на хэш SHA-256
+    ELSIF p_table_name = 'digital_profiles' THEN
+        IF v_result ? 'password_hash' AND v_result->>'password_hash' IS NOT NULL THEN
+            v_result := jsonb_set(
+                v_result,
+                '{password_hash}',
+                to_jsonb('[MASKED_SHA256:' || left(encode(digest(v_result->>'password_hash', 'sha256'), 'hex'), 16) || ']'),
+                false
+            );
+        END IF;
+
+    -- Таблица документов: маскирование серии и номера паспорта + SHA-256 хэш
+    ELSIF p_table_name = 'identity_documents' THEN
+        IF v_result ? 'document_number' AND v_result->>'document_number' IS NOT NULL THEN
+            v_result := jsonb_set(
+                v_result,
+                '{document_number_sha256}',
+                to_jsonb(encode(digest(v_result->>'document_number', 'sha256'), 'hex')),
+                true
+            );
+            v_result := jsonb_set(
+                v_result,
+                '{document_number}',
+                to_jsonb('** ** ***' || right(v_result->>'document_number', 3)),
+                false
+            );
+        END IF;
+
+    -- Таблица биометрии: маскирование зашифрованного слепка и шаблона
+    ELSIF p_table_name = 'biometrics' THEN
+        IF v_result ? 'raw_data_enc' THEN
+            v_result := jsonb_set(
+                v_result,
+                '{raw_data_enc}',
+                to_jsonb('[ENCRYPTED_BYTEA_MASKED]'),
+                false
+            );
+        END IF;
+        IF v_result ? 'template_hash' AND v_result->>'template_hash' IS NOT NULL THEN
+            v_result := jsonb_set(
+                v_result,
+                '{template_hash}',
+                to_jsonb(left(v_result->>'template_hash', 8) || '...[MASKED]'),
+                false
+            );
+        END IF;
+    END IF;
+
+    RETURN v_result;
+END;
+$$;
+
+-- Триггерная функция записи изменений в audit.row_change_log
+CREATE OR REPLACE FUNCTION audit.fn_log_row_changes()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = audit, app, ref, public
+AS $$
+DECLARE
+    v_old_json JSONB;
+    v_new_json JSONB;
+    v_record_id UUID;
+    v_segment_id INT;
+    v_actor_id TEXT := NULLIF(current_setting('app.actor_id', true), '');
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        v_old_json := audit.fn_mask_sensitive_jsonb(TG_TABLE_NAME, to_jsonb(OLD));
+        v_new_json := audit.fn_mask_sensitive_jsonb(TG_TABLE_NAME, to_jsonb(NEW));
+        v_record_id := COALESCE((to_jsonb(NEW)->>'id')::UUID, (to_jsonb(OLD)->>'id')::UUID);
+        v_segment_id := COALESCE((to_jsonb(NEW)->>'segment_id')::INT, (to_jsonb(OLD)->>'segment_id')::INT);
+    ELSIF TG_OP = 'DELETE' THEN
+        v_old_json := audit.fn_mask_sensitive_jsonb(TG_TABLE_NAME, to_jsonb(OLD));
+        v_new_json := NULL;
+        v_record_id := (to_jsonb(OLD)->>'id')::UUID;
+        v_segment_id := (to_jsonb(OLD)->>'segment_id')::INT;
+    END IF;
+
+    INSERT INTO audit.row_change_log (changed_at, db_user,
+                                      session_user_name, actor_id,
+                                      segment_id, schema_name,
+                                      table_name, operation,
+                                      record_id, old_data, new_data
+    ) VALUES (now(), current_user,
+              session_user, COALESCE(v_actor_id, session_user),
+              v_segment_id, TG_TABLE_SCHEMA,
+              TG_TABLE_NAME, TG_OP,
+              v_record_id, v_old_json, v_new_json);
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    ELSE
+        RETURN NEW;
+    END IF;
+END;
+$$;
+
+-- Назначение триггеров AFTER UPDATE OR DELETE на 3 критичные таблицы
+CREATE TRIGGER trg_audit_citizens_changes
+    AFTER UPDATE OR DELETE ON app.citizens
+    FOR EACH ROW EXECUTE FUNCTION audit.fn_log_row_changes();
+
+CREATE TRIGGER trg_audit_digital_profiles_changes
+    AFTER UPDATE OR DELETE ON app.digital_profiles
+    FOR EACH ROW EXECUTE FUNCTION audit.fn_log_row_changes();
+
+CREATE TRIGGER trg_audit_identity_documents_changes
+    AFTER UPDATE OR DELETE ON app.identity_documents
+    FOR EACH ROW EXECUTE FUNCTION audit.fn_log_row_changes();
+
+
+
+-- Индексы для политик RLS для оптимизации запросов
+CREATE INDEX IF NOT EXISTS idx_profiles_rls_segment_active_trust
+    ON app.digital_profiles (segment_id, is_active, trust_level_id);
+
+CREATE INDEX IF NOT EXISTS idx_documents_rls_segment_verified_expiry
+    ON app.identity_documents (segment_id, is_verified, expiry_date);
+
+
+
+-- Автоматичнское резервное копирование
+
+-- Создание резервной таблицы
+CREATE TABLE IF NOT EXISTS audit.row_change_log_archive (
+    LIKE audit.row_change_log INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES,
+    archived_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    archived_by VARCHAR(100) NOT NULL DEFAULT current_user
+);
+
+COMMENT ON TABLE audit.row_change_log_archive IS
+    'Архивная таблица исторических записей журнала изменений audit.row_change_log';
+
+CREATE OR REPLACE FUNCTION audit.backup_audit_logs(days_interval INT)
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = audit, public
+AS $$
+DECLARE
+    v_moved_count INT := 0;
+BEGIN
+    IF days_interval IS NULL OR days_interval < 0 THEN
+        RAISE EXCEPTION 'Интервал архивации days_interval должен быть неотрицательным числом';
+    END IF;
+
+    WITH moved_rows AS (
+        DELETE FROM audit.row_change_log
+        WHERE changed_at < (now() - make_interval(days => days_interval))
+        RETURNING
+            id, changed_at, db_user, session_user_name, actor_id,
+            segment_id, schema_name, table_name, operation,
+            record_id, old_data, new_data
+    )
+    INSERT INTO audit.row_change_log_archive (
+        id, changed_at, db_user, session_user_name, actor_id,
+        segment_id, schema_name, table_name, operation,
+        record_id, old_data, new_data, archived_at, archived_by
+    )
+    SELECT
+        id, changed_at, db_user, session_user_name, actor_id,
+        segment_id, schema_name, table_name, operation,
+        record_id, old_data, new_data, now(), session_user
+    FROM moved_rows;
+
+    GET DIAGNOSTICS v_moved_count = ROW_COUNT;
+
+    INSERT INTO audit.function_calls (function_name, caller_role, input_params, success)
+    VALUES (
+        'audit.backup_audit_logs',
+        session_user,
+        jsonb_build_object('days_interval', days_interval, 'archived_rows', v_moved_count),
+        TRUE
+    );
+
+    RETURN v_moved_count;
+END;
+$$;
+
+-- Настройка прав доступа к таблицам и функциям аудита
+GRANT SELECT ON audit.row_change_log, audit.row_change_log_archive TO auditor, app_owner;
+REVOKE INSERT, UPDATE, DELETE ON audit.row_change_log, audit.row_change_log_archive
+    FROM PUBLIC, app_reader, app_writer, dml_admin, auditor;
+
+REVOKE ALL ON FUNCTION audit.backup_audit_logs(INT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION audit.backup_audit_logs(INT) TO auditor, app_owner, security_admin;

@@ -336,3 +336,181 @@ ORDER BY s.id;
 SELECT id, first_name, last_name, snils, segment_id FROM app.citizens ORDER BY segment_id, snils;
 COMMIT;
 RESET ROLE;
+
+
+
+
+
+-- ЛР4
+
+-- ТЕСТ 1 (Кейс 1): Попытка обхода WITH CHECK OPTION (должна блокироваться)
+SET ROLE app_writer;
+SELECT app.set_session_ctx(1, 'operator_ivanov');
+
+-- Просмотр доступных строк через рабочее представление
+SELECT id, login, trust_level_id, is_active, segment_id
+FROM app.v_working_digital_profiles;
+
+-- Попытка повысить уровень доверия до 4 (BIOMETRIC) или деактивировать профиль
+-- в обход ограничения представления (trust_level_id <= 3 AND is_active = true):
+UPDATE app.v_working_digital_profiles
+SET trust_level_id = 4
+WHERE segment_id = 1;
+-- Ожидаемый результат: ERROR: new row violates check option for view "v_working_digital_profiles"
+RESET ROLE;
+
+
+
+-- ТЕСТ 2 (Кейс 2): Попытка получения деталей через SECURITY BARRIER VIEW
+SET ROLE app_owner;
+CREATE OR REPLACE FUNCTION app.f_side_channel_leak(p_val TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+COST 1
+AS $$
+BEGIN
+    RAISE NOTICE 'Утечка данных через канал: %', p_val;
+    RETURN true;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION app.f_side_channel_leak(TEXT) TO app_reader;
+RESET ROLE;
+
+SET ROLE app_reader;
+SELECT app.set_session_ctx(1, 'reader_petrov');
+
+-- Запрос к SECURITY BARRIER VIEW возвращает только агрегаты разрешенного сегмента 1
+-- (для сегментов 2 и 3 количество профилей равно 0), а функция-ловушка не может
+-- получить доступ к скрытым строкам или индивидуальным полям login/snils:
+SELECT segment_id, segment_code, trust_level, total_profiles, active_profiles, verified_docs_count
+FROM app.v_segment_security_stats
+WHERE app.f_side_channel_leak(segment_code || ':' || COALESCE(trust_level, 'NONE'));
+RESET ROLE;
+
+
+
+-- ТЕСТ 3 (Кейс 3): Изменение строки и проверка записи в audit.row_change_log
+SET ROLE app_writer;
+SELECT app.set_session_ctx(1, 'operator_ivanov');
+
+-- Изменяем фамилию гражданина и номер документа в сегменте 1
+UPDATE app.citizens
+SET last_name = last_name || '-Обновлен'
+WHERE id = (SELECT id FROM app.citizens WHERE segment_id = 1 LIMIT 1);
+
+UPDATE app.identity_documents
+SET is_verified = true
+WHERE id = (SELECT id FROM app.identity_documents WHERE segment_id = 1 LIMIT 1);
+RESET ROLE;
+
+-- Проверяем под ролью auditor появление записей и маскирование СНИЛС/паспорта
+SET ROLE auditor;
+SELECT id, changed_at, db_user, actor_id, segment_id, table_name, operation, old_data, new_data
+FROM audit.row_change_log
+ORDER BY id DESC
+LIMIT 5;
+RESET ROLE;
+
+
+
+-- ТЕСТ 4 (Кейс 4): Попытка удаления строки не из своего сегмента
+SET ROLE app_writer;
+SELECT app.set_session_ctx(1, 'operator_ivanov');
+
+-- 4.1. Попытка удалить записи сегмента 3 (SEG_SPECIAL), находясь в сегменте 1:
+-- Политика RLS отфильтровывает чужие записи (DELETE 0)
+DELETE FROM app.citizens WHERE segment_id = 3;
+
+-- 4.2. Попытка переключить контекст на недоступный сегмент 3 для удаления:
+-- Вызывает явную ошибку безопасности RLS/контекста
+SELECT app.set_session_ctx(3, 'operator_ivanov');
+
+-- 4.3. Попытка принудительно перенести строку из своего сегмента 1 в чужой сегмент 3:
+-- Блокируется политикой RLS: ERROR: new row violates row-level security policy for table "citizens"
+UPDATE app.citizens SET segment_id = 3 WHERE segment_id = 1;
+RESET ROLE;
+
+
+
+-- ТЕСТ 5 (Задание 4): Анализ производительности EXPLAIN (ANALYZE, BUFFERS)
+-- Для наглядной оценки планов запросов добавим тестовую выборку (3000 записей)
+SET ROLE app_owner;
+INSERT INTO app.citizens (first_name, last_name, birth_date, snils, segment_id)
+SELECT
+    'Гражданин_' || g,
+    'Тестовый_' || g,
+    '1980-01-01'::date + (g % 10000),
+    lpad((g / 1000000)::text, 3, '0') || '-' || lpad(((g / 1000) % 1000)::text, 3, '0') || '-' || lpad((g % 1000)::text, 3, '0') || ' ' || lpad((g % 100)::text, 2, '0'),
+    (g % 3) + 1
+FROM generate_series(1000, 3999) AS g
+ON CONFLICT (snils) DO NOTHING;
+
+INSERT INTO app.digital_profiles (citizen_id, login, password_hash, trust_level_id, is_active, segment_id)
+SELECT
+    c.id,
+    'bench_user_' || c.snils || '@gos.ru',
+    'hash_' || c.snils,
+    (random() * 3 + 1)::int,
+    (random() > 0.1),
+    c.segment_id
+FROM app.citizens c
+WHERE NOT EXISTS (SELECT 1 FROM app.digital_profiles dp WHERE dp.citizen_id = c.id);
+
+ANALYZE app.citizens;
+ANALYZE app.digital_profiles;
+ANALYZE app.identity_documents;
+
+-- Запрос 1 и 2 ДО RLS (от роли владельца с отключенным FORCE RLS для эталонного замера)
+ALTER TABLE app.citizens NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE app.digital_profiles NO FORCE ROW LEVEL SECURITY;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, first_name, last_name, snils
+FROM app.citizens
+WHERE segment_id = 1 AND snils LIKE '000-001-%';
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT dp.id, dp.login, dp.trust_level_id
+FROM app.digital_profiles dp
+WHERE dp.segment_id = 1 AND dp.is_active = true AND dp.trust_level_id = 2;
+
+ALTER TABLE app.citizens FORCE ROW LEVEL SECURITY;
+ALTER TABLE app.digital_profiles FORCE ROW LEVEL SECURITY;
+RESET ROLE;
+
+-- Запрос 1 и 2 ПОСЛЕ включения RLS и профильных индексов (от роли app_reader)
+SET ROLE app_reader;
+SELECT app.set_session_ctx(1, 'reader_bench');
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, first_name, last_name, snils
+FROM app.citizens
+WHERE snils LIKE '000-001-%';
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT dp.id, dp.login, dp.trust_level_id
+FROM app.digital_profiles dp
+WHERE dp.trust_level_id = 2;
+RESET ROLE;
+
+
+
+-- ТЕСТ 6 (Задание 5): Автоматическое резервное копирование audit-логов
+
+SET ROLE app_owner;
+-- Искусственно состарим первую запись в audit.row_change_log на 45 дней назад
+UPDATE audit.row_change_log
+SET changed_at = now() - interval '45 days'
+WHERE id = (SELECT min(id) FROM audit.row_change_log);
+
+-- Просмотр журналов ДО архивации
+SELECT id, changed_at, table_name, operation FROM audit.row_change_log ORDER BY id;
+SELECT count(*) AS archive_count_before FROM audit.row_change_log_archive;
+
+-- Запуск функции архивации для записей старше 30 дней
+SELECT audit.backup_audit_logs(30) AS moved_records_count;
+
+-- Просмотр основного и архивного журналов ПОСЛЕ архивации
+SELECT id, changed_at, table_name, operation FROM audit.row_change_log ORDER BY id;
+SELECT id, changed_at, archived_at, archived_by, table_name, operation FROM audit.row_change_log_archive ORDER BY id;
+RESET ROLE;
